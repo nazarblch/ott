@@ -22,7 +22,7 @@ from . import (
     problems,
     solvers,
     tools,
-    utils,
+    utils
 )
 
 with contextlib.suppress(ImportError):
