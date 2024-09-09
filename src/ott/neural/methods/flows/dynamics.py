@@ -167,7 +167,7 @@ class BrownianBridge(StraightFlow):
 class LagrangianFlow(StraightFlow):
 
   def compute_sigma_t(self, t: jnp.ndarray) -> jnp.ndarray:
-    return jnp.full_like(t, fill_value=self.sigma)
+    return self.sigma * jnp.sqrt(t * (1 - t))
 
   def compute_inverse_control_matrix(self, t: jnp.ndarray, x_t: jnp.ndarray) -> jnp.ndarray:
     return jnp.eye(x_t.shape[1], x_t.shape[1])
