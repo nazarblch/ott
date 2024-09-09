@@ -92,9 +92,28 @@ class NeuralOC:
         U_t = self.flow.compute_potential(t, x_t)
 
         dsdtdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=[1,2])
+        dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
 
         dsdt, dsdx = dsdtdx_fn(params, t, x_t, x_0)
-        s_diff = (dsdt - 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + U_t)
+        # keys = jax.random.split(key_t)
+        # eps = jax.random.randint(keys[0], x_t.shape, 0, 2).astype(float)*2 - 1.0
+        # _, jvp_val = jax.jvp(lambda __x: dsdx_fn(params, t, __x, x_0), (x_t,), (eps,))
+
+        @partial(jax.vmap, in_axes=(None, 0, 0, 0))
+        def laplacian(p, t, x, x0):
+            fun = lambda __x: state.apply_fn(p,t,__x,x0).sum()
+            return jnp.trace(jax.jacfwd(jax.jacrev(fun))(x))
+
+        # @partial(jax.vmap, in_axes=(None, 0, 0, 0, None))
+        # def laplacian(p, t, x, x0, key):
+        #     u = jax.random.rademacher(key, (x.shape[-1],)).reshape(-1) * 1.0
+        #     fun = lambda __x: state.apply_fn(p,t,__x,x0).sum()
+        #     gf = lambda __x: (jax.grad(fun)(__x) * u).sum()
+        #     return (jax.grad(gf)(x) * u).sum()
+          
+        D = (0.5 * self.flow.compute_sigma_t(t) ** 2).reshape(-1, 1)
+        # print(laplacian(params, t, x_t, x_0, key_t).reshape(-1, 1))
+        s_diff = dsdt - 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + U_t + D * laplacian(params, t, x_t, x_0).reshape(-1, 1)
         loss = (s_diff ** 2).mean() + 0.05 * jnp.abs(s_diff).mean() 
 
         return loss
@@ -109,35 +128,38 @@ class NeuralOC:
         dsdtdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=[1,2])
 
         def move(carry, _):
-          t_, x_ = carry
+          t_, x_, key_ = carry
           _, dsdx = dsdtdx_fn(state.params, t_, x_, x_0)
           At_T = self.flow.compute_inverse_control_matrix(t_, x_).transpose()
-          x_ = x_ - dt * dsdx @ At_T
+          sigma = self.flow.compute_sigma_t(t_)
+          key_, key_s = jax.random.split(key_)
+          x_ = x_ - dt * dsdx @ At_T + sigma * jax.random.normal(key_s, shape=x_.shape) * dt
           t_ = t_ + dt
-          return (t_, x_), x_
+          return (t_, x_, key_), x_
         
-        _, result = jax.lax.scan(move, (t_0, x_0), None, length=steps_count)
+        _, result = jax.lax.scan(move, (t_0, x_0, key), None, length=steps_count)
         x_1_pred = jax.lax.stop_gradient(result[-1])
 
         dual_loss = - (-state.apply_fn(params, t_1, x_1, x_0 * 0) + state.apply_fn(params, t_1, x_1_pred, x_0 * 0)).mean()
+        reg_loss = 0
 
         # exp. reg
 
-        source, target = x_0, x_1
-        target_hat_detach = x_1_pred
-        batch_cost = lambda x, y: 0.5 * jax.vmap(costs.SqEuclidean())(jnp.atleast_2d(x), jnp.atleast_2d(y)).reshape(-1)
-        g_target = -state.apply_fn(params, t_1, x_1, x_0 * 0).reshape(-1)
-        g_star_source = batch_cost(source, target_hat_detach) + state.apply_fn(params, t_1, x_1_pred, x_0 * 0).reshape(-1)
+        # source, target = x_0, x_1
+        # target_hat_detach = x_1_pred
+        # batch_cost = lambda x, y: 0.5 * jax.vmap(costs.SqEuclidean())(jnp.atleast_2d(x), jnp.atleast_2d(y)).reshape(-1)
+        # g_target = -state.apply_fn(params, t_1, x_1, x_0 * 0).reshape(-1)
+        # g_star_source = batch_cost(source, target_hat_detach) + state.apply_fn(params, t_1, x_1_pred, x_0 * 0).reshape(-1)
 
-        diff_1 = jax.lax.stop_gradient(g_star_source - batch_cost(source, target))\
-          + g_target
-        reg_loss_1 = expectile_loss(diff_1).mean()
+        # diff_1 = jax.lax.stop_gradient(g_star_source - batch_cost(source, target))\
+        #   + g_target
+        # reg_loss_1 = expectile_loss(diff_1).mean()
 
-        diff_2 = jax.lax.stop_gradient(g_target - batch_cost(source, target))\
-          + g_star_source
-        reg_loss_2 = expectile_loss(diff_2).mean()
+        # diff_2 = jax.lax.stop_gradient(g_target - batch_cost(source, target))\
+        #   + g_star_source
+        # reg_loss_2 = expectile_loss(diff_2).mean()
 
-        reg_loss = (reg_loss_1 + reg_loss_2) * 0.5
+        # reg_loss = (reg_loss_1 + reg_loss_2) * 0.5
 
         return (reg_loss + dual_loss)  * weight
 
@@ -177,7 +199,6 @@ class NeuralOC:
     loop_key = utils.default_prng_key(rng)
     training_logs = {"cost_loss": [], "potential_loss": []}
     it = 0
-    u0 = 0.5
 
     for batch in tqdm(loader):
       # batch = jtu.tree_map(jnp.asarray, batch)
@@ -213,6 +234,7 @@ class NeuralOC:
     dt = 1.0 / 30
     t_0 = 0.0
     n = 30
+    loop_key = jax.random.PRNGKey(0)
   
     @jax.jit
     def inference(state, x_0):
@@ -220,15 +242,18 @@ class NeuralOC:
       dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
       
       def move(carry, _):
-        t_, x_, cost = carry
+        t_, x_, cost, key_ = carry
         u = dsdx_fn(state.params, t_ * jnp.ones([x.shape[0],1]), x_, x_0)
         At_T = self.flow.compute_inverse_control_matrix(t_, x_).transpose()
-        x_ = x_ - dt * u @ At_T
+        U_t = self.flow.compute_potential(t_, x_)
+        sigma = self.flow.compute_sigma_t(t_)
+        key_, key_s = jax.random.split(key_)
+        x_ = x_ - dt * u @ At_T + sigma * jax.random.normal(key_s, shape=x_.shape) * dt
         t_ = t_ + dt
-        cost += 0.5 * (u ** 2).sum(-1).mean() * dt
-        return (t_, x_, cost), x_
+        cost += 0.5 * ((u @ At_T) * u).sum(-1).mean() * dt + U_t * dt
+        return (t_, x_, cost, key_), x_
           
-      (_, _, cost), result = jax.lax.scan(move, (t_0, x_0, 0.0), None, length=n)
+      (_, _, cost, _), result = jax.lax.scan(move, (t_0, x_0, 0.0, loop_key), None, length=n)
       return cost, result
     
     cost, result = inference(self.state, x)
