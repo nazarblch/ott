@@ -20,7 +20,7 @@ import jax.tree_util as jtu
 import numpy as np
 import math
 from ott.geometry import costs
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 # import diffrax
 from functools import partial
@@ -92,7 +92,7 @@ class NeuralOC:
         U_t = self.flow.compute_potential(t, x_t)
 
         dsdtdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=[1,2])
-        dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
+        #dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
 
         dsdt, dsdx = dsdtdx_fn(params, t, x_t, x_0)
         # keys = jax.random.split(key_t)
@@ -113,7 +113,7 @@ class NeuralOC:
           
         D = (0.5 * self.flow.compute_sigma_t(t) ** 2).reshape(-1, 1)
         # print(laplacian(params, t, x_t, x_0, key_t).reshape(-1, 1))
-        s_diff = dsdt - 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + U_t + D * laplacian(params, t, x_t, x_0).reshape(-1, 1)
+        s_diff = dsdt - 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + 400 * U_t + D * laplacian(params, t, x_t, x_0).reshape(-1, 1)
         loss = (s_diff ** 2).mean() + 0.05 * jnp.abs(s_diff).mean() 
 
         return loss
@@ -200,11 +200,10 @@ class NeuralOC:
     training_logs = {"cost_loss": [], "potential_loss": []}
     it = 0
 
-    for batch in tqdm(loader):
+    for batch in tqdm(loader, total=n_iters):
       # batch = jtu.tree_map(jnp.asarray, batch)
 
       src, tgt = batch["src_lin"], batch["tgt_lin"]
-      # src_cond = batch.get("src_condition")
       it_key = jax.random.fold_in(loop_key, it)
 
       if it % 4 != 0:
@@ -250,7 +249,7 @@ class NeuralOC:
         key_, key_s = jax.random.split(key_)
         x_ = x_ - dt * u @ At_T + sigma * jax.random.normal(key_s, shape=x_.shape) * dt
         t_ = t_ + dt
-        cost += 0.5 * ((u @ At_T) * u).sum(-1).mean() * dt + U_t * dt
+        cost += (0.5 * ((u @ At_T) * u).sum(-1).mean() * dt + 400 *U_t).mean() * dt
         return (t_, x_, cost, key_), x_
           
       (_, _, cost, _), result = jax.lax.scan(move, (t_0, x_0, 0.0, loop_key), None, length=n)
@@ -259,8 +258,14 @@ class NeuralOC:
     cost, result = inference(self.state, x)
     x_seq = [TimedX(t=t_0, x=x)]
 
-    for i in range(n):
-      t_ = x_seq[-1].t + dt
-      x_seq.append(TimedX(t=t_, x=result[i]))
+    def compute_timesteps(carry, _):
+      t_0, step = carry
+      t_0 = t_0 + dt
+      return (t_0, step+1), TimedX(t=t_0, x=result[step])
+    
+    x_seq = jax.lax.scan(compute_timesteps, init=(t_0, 0), length=n)[1]
+    # for i in range(n):
+    #   t_ = x_seq[-1].t + dt
+    #   x_seq.append(TimedX(t=t_, x=result[i]))
       
     return cost, x_seq

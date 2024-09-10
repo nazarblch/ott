@@ -31,8 +31,12 @@ class BaseFlow(abc.ABC):
     sigma: Noise used for computing time-dependent noise schedule.
   """
 
-  def __init__(self, sigma: float):
+  def __init__(self, sigma: float, potential=None):
     self.sigma = sigma
+    self.potential = potential
+    if self.potential is not None:
+      key = jax.random.PRNGKey(42)
+      self.potential_params = potential.init(key, jnp.ones((2, )))
 
   @abc.abstractmethod
   def compute_mu_t(
@@ -173,6 +177,8 @@ class LagrangianFlow(StraightFlow):
     return jnp.eye(x_t.shape[1], x_t.shape[1])
 
   def compute_potential(self, t: jnp.ndarray, x_t: jnp.ndarray) -> jnp.ndarray:
+    if self.potential is not None:
+      return -jax.vmap(self.potential.apply, in_axes=(None, 0))(self.potential_params, x_t)
     return 0
 
   
