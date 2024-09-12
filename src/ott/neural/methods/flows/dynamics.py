@@ -178,7 +178,7 @@ class LagrangianFlow(StraightFlow):
 
   def compute_potential(self, t: jnp.ndarray, x_t: jnp.ndarray) -> jnp.ndarray:
     if self.potential is not None:
-      return -jax.vmap(self.potential.apply, in_axes=(None, 0))(self.potential_params, x_t)
+      return jax.vmap(self.potential.apply, in_axes=(None, 0))(self.potential_params, x_t)
     return 0
 
   
