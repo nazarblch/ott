@@ -173,7 +173,7 @@ class NeuralOC:
         state = state.apply_gradients(grads=grads)
         
         grad_fn = jax.value_and_grad(potential_loss, argnums=1, has_aux=False)
-        loss_potential, potential_grads = grad_fn(state, state.params, key, 20, 20, source, target)
+        loss_potential, potential_grads = grad_fn(state, state.params, key, 20, 25, source, target)
         state = state.apply_gradients(grads=potential_grads)
         
         return state, loss, loss_potential
@@ -192,26 +192,27 @@ class NeuralOC:
     
     loop_key = utils.default_prng_key(rng)
     training_logs = {"cost_loss": [], "potential_loss": []}
-    it = 0
 
-    for batch in tqdm(loader, total=n_iters):
+    pbar = tqdm(loader, total=n_iters)
+    for it, batch in enumerate(pbar):
       # batch = jtu.tree_map(jnp.asarray, batch)
 
       src, tgt = batch["src_lin"], batch["tgt_lin"]
       it_key = jax.random.fold_in(loop_key, it)
 
-      if it % 4 != 0:
+      if it % 2 != 0:
         self.state, loss = self.train_step_cost(self.state, it_key, src, tgt)
       else:
         self.state, loss, loss_potential = self.train_step_with_potential(self.state, it_key, src, tgt)
         training_logs["potential_loss"].append(loss_potential)
 
+      if (it % 500) == 0:
+        pbar.set_postfix({"Loss": float(loss)})
       training_logs["cost_loss"].append(loss)
       
       if it % 5000 == 0 and it > 0 and callback is not None:
         callback(it, training_logs, self.transport)
 
-      it += 1
       if it >= n_iters:
         break
 
