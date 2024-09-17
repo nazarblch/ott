@@ -94,7 +94,7 @@ class NeuralOC:
         U_t = self.flow.compute_potential(t, x_t)
 
         dsdtdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=[1,2])
-        # dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
+        dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
 
         dsdt, dsdx = dsdtdx_fn(params, t, x_t, x_0)
         # keys = jax.random.split(key_t)

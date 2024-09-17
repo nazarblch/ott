@@ -174,7 +174,7 @@ class LagrangianFlow(StraightFlow):
     return self.sigma * jnp.sqrt(t * (1 - t))
 
   def compute_inverse_control_matrix(self, t: jnp.ndarray, x_t: jnp.ndarray) -> jnp.ndarray:
-    return jnp.eye(x_t.shape[1], x_t.shape[1])
+    return jnp.eye(x_t.shape[-1], x_t.shape[-1])
 
   def compute_potential(self, t: jnp.ndarray, x_t: jnp.ndarray) -> jnp.ndarray:
     if self.potential is not None:
