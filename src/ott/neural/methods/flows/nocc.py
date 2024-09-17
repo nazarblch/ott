@@ -51,6 +51,7 @@ class NeuralOC:
       value_model: nn.Module,
       optimizer: Optional[optax.GradientTransformation],
       flow: dynamics.LagrangianFlow,
+      potential_weight: float,
       time_sampler: Callable[[jax.Array, int], jnp.ndarray] = solver_utils.uniform_sampler,
       key:Optional[jax.Array] = None,
       **kwargs: Any,
@@ -58,6 +59,7 @@ class NeuralOC:
     self.value_model = value_model
     self.flow = flow
     self.time_sampler = time_sampler
+    self.potential_weight = potential_weight
    
     key, init_key = jax.random.split(key, 2)
     params = value_model.init(
@@ -92,7 +94,7 @@ class NeuralOC:
         U_t = self.flow.compute_potential(t, x_t)
 
         dsdtdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=[1,2])
-        dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
+        # dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
 
         dsdt, dsdx = dsdtdx_fn(params, t, x_t, x_0)
         # keys = jax.random.split(key_t)
@@ -113,10 +115,10 @@ class NeuralOC:
           
         D = (0.5 * self.flow.compute_sigma_t(t) ** 2).reshape(-1, 1)
         # print(laplacian(params, t, x_t, x_0, key_t).reshape(-1, 1))
-        s_diff = dsdt - 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + U_t + D * laplacian(params, t, x_t, x_0).reshape(-1, 1)
-        loss = (s_diff ** 2).mean() + 0.05 * jnp.abs(s_diff).mean() 
+        s_diff = dsdt - 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + self.potential_weight * U_t.reshape(-1, 1) + D * laplacian(params, t, x_t, x_0).reshape(-1, 1)
+        loss = jnp.abs(s_diff).mean() 
 
-        return loss
+        return loss / 5
 
       def potential_loss(state, params, key, steps_count, weight, source, target):
         bs = source.shape[0]
@@ -179,7 +181,7 @@ class NeuralOC:
         state = state.apply_gradients(grads=grads)
         
         grad_fn = jax.value_and_grad(potential_loss, argnums=1, has_aux=False)
-        loss_potential, potential_grads = grad_fn(state, state.params, key, 30, 10, source, target)
+        loss_potential, potential_grads = grad_fn(state, state.params, key, 30, 1, source, target)
         state = state.apply_gradients(grads=potential_grads)
         
         return state, loss, loss_potential
@@ -207,11 +209,11 @@ class NeuralOC:
       # src_cond = batch.get("src_condition")
       it_key = jax.random.fold_in(loop_key, it)
 
-      if it % 4 != 0:
-        self.state, loss = self.train_step_cost(self.state, it_key, src, tgt)
-      else:
-        self.state, loss, loss_potential = self.train_step_with_potential(self.state, it_key, src, tgt)
-        training_logs["potential_loss"].append(loss_potential)
+      # if it % 2 != 0:
+      #   self.state, loss = self.train_step_cost(self.state, it_key, src, tgt)
+      # else:
+      self.state, loss, loss_potential = self.train_step_with_potential(self.state, it_key, src, tgt)
+      training_logs["potential_loss"].append(loss_potential)
 
       training_logs["cost_loss"].append(loss)
       
@@ -250,7 +252,7 @@ class NeuralOC:
         key_, key_s = jax.random.split(key_)
         x_ = x_ - dt * u @ At_T + sigma * jax.random.normal(key_s, shape=x_.shape) * dt
         t_ = t_ + dt
-        cost += 0.5 * ((u @ At_T) * u).sum(-1).mean() * dt + U_t * dt
+        cost += 0.5 * ((u @ At_T) * u).sum(-1).mean() * dt + U_t.mean() * dt * self.potential_weight
         return (t_, x_, cost, key_), x_
           
       (_, _, cost, _), result = jax.lax.scan(move, (t_0, x_0, 0.0, loop_key), None, length=n)
