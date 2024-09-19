@@ -116,9 +116,9 @@ class NeuralOC:
         D = (0.5 * self.flow.compute_sigma_t(t) ** 2).reshape(-1, 1)
         # print(laplacian(params, t, x_t, x_0, key_t).reshape(-1, 1))
         s_diff = dsdt - 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + self.potential_weight * U_t.reshape(-1, 1) + D * laplacian(params, t, x_t, x_0).reshape(-1, 1)
-        loss = jnp.abs(s_diff).mean() 
+        loss = jnp.abs(s_diff ** 2).mean() 
 
-        return loss / 5
+        return loss 
 
       def potential_loss(state, params, key, steps_count, weight, source, target):
         bs = source.shape[0]
@@ -209,11 +209,11 @@ class NeuralOC:
       # src_cond = batch.get("src_condition")
       it_key = jax.random.fold_in(loop_key, it)
 
-      # if it % 2 != 0:
-      #   self.state, loss = self.train_step_cost(self.state, it_key, src, tgt)
-      # else:
-      self.state, loss, loss_potential = self.train_step_with_potential(self.state, it_key, src, tgt)
-      training_logs["potential_loss"].append(loss_potential)
+      if it % 2 != 0:
+        self.state, loss = self.train_step_cost(self.state, it_key, src, tgt)
+      else:
+        self.state, loss, loss_potential = self.train_step_with_potential(self.state, it_key, src, tgt)
+        training_logs["potential_loss"].append(loss_potential)
 
       training_logs["cost_loss"].append(loss)
       
