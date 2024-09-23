@@ -16,13 +16,13 @@ from typing import NamedTuple, Any
 
 import jax
 import jax.numpy as jnp
-import jax.tree_util as jtu
+from jax.experimental.shard_map import shard_map
+from jax.sharding import Mesh, PartitionSpec as P
 import numpy as np
-import math
-from ott.geometry import costs
 from tqdm.auto import tqdm
 
 # import diffrax
+import flax
 from functools import partial
 from flax.training import train_state
 from flax import linen as nn
@@ -44,7 +44,23 @@ class TimedX(NamedTuple):
   t: Any
   x: Any
 
-
+def init_model(rng: jax.random.PRNGKey, t: jax.Array, x: jax.Array, model: nn.Module, optimizer) -> train_state.TrainState:
+  key, init_key = jax.random.split(rng, 2)
+  params = model.init(
+      init_key, 
+      t, 
+      x,
+      x
+      # jnp.ones([1, input_dim]), 
+      # jnp.ones([1, input_dim])
+    ) # t, x0, _
+  state = train_state.TrainState.create(
+    apply_fn=model.apply,
+    params=params,
+    tx=optimizer
+  )
+  return state
+        
 class NeuralOC:
   
   def __init__(
@@ -55,26 +71,40 @@ class NeuralOC:
       flow: dynamics.LagrangianFlow,
       time_sampler: Callable[[jax.Array, int], jnp.ndarray] = solver_utils.uniform_sampler,
       key:Optional[jax.Array] = None,
-      potential_weight: float = 1.0,
+      potential_weight: float = 0.0,
       **kwargs: Any,
   ):
     self.value_model = value_model
     self.flow = flow
     self.time_sampler = time_sampler
-   
-    key, init_key = jax.random.split(key, 2)
-    params = value_model.init(
-      init_key, 
-      jnp.ones([1, 1]), 
-      jnp.ones([1, input_dim]), 
-      jnp.ones([1, input_dim])
+    
+    self.mesh = Mesh(np.array(jax.devices()), ("data", ))
+    time = jnp.ones(shape=(jax.device_count(), 1))
+    input_data = jnp.ones(shape=(jax.device_count(), input_dim))
+    # self.state = init_model(key, input_dim, value_model, optimizer)
+    init_dp_fn = jax.jit(
+        shard_map(
+            partial(init_model, model=value_model, optimizer=optimizer),
+            mesh=self.mesh,
+            in_specs=(P(None), P("data", ), P("data", )),
+            out_specs=P(),
+            check_rep=False,
+        )
     )
+    self.state = init_dp_fn(key, time, input_data)
+    # key, init_key = jax.random.split(key, 2)
+    # params = value_model.init(
+    #   init_key, 
+    #   jnp.ones([1, 1]), 
+    #   jnp.ones([1, input_dim]), 
+    #   jnp.ones([1, input_dim])
+    # ) # t, x0, _
 
-    self.state = train_state.TrainState.create(
-      apply_fn=value_model.apply,
-      params=params,
-      tx=optimizer
-    )
+    # self.state = train_state.TrainState.create(
+    #   apply_fn=value_model.apply,
+    #   params=params,
+    #   tx=optimizer
+    # )
 
     self.potential_weight = potential_weight
     self.train_step_cost, self.train_step_with_potential = self._get_step_fn()
@@ -94,6 +124,7 @@ class NeuralOC:
         U_t = self.flow.compute_potential(t, x_t)
 
         dsdtdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=[1,2])
+        dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
 
         dsdt, dsdx = dsdtdx_fn(params, t, x_t, x_0)
         # keys = jax.random.split(key_t)
@@ -104,12 +135,12 @@ class NeuralOC:
         def laplacian(p, t, x, x0):
             fun = lambda __x: state.apply_fn(p,t,__x,x0).sum()
             return jnp.trace(jax.jacfwd(jax.jacrev(fun))(x))
-
+          
         D = (0.5 * self.flow.compute_sigma_t(t) ** 2).reshape(-1, 1)
         # print(laplacian(params, t, x_t, x_0, key_t).reshape(-1, 1))
-        s_diff = dsdt - 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + self.potential_weight * U_t + D * laplacian(params, t, x_t, x_0).reshape(-1, 1)
-        loss = (s_diff ** 2).mean() + 0.05 * jnp.abs(s_diff).mean() 
-        #loss = jnp.abs(s_diff).mean()
+        s_diff = dsdt - 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + self.potential_weight * U_t.reshape(-1, 1) + D * laplacian(params, t, x_t, x_0).reshape(-1, 1)
+        loss = jnp.abs(s_diff).mean() 
+
         return loss
 
       def potential_loss(state, params, key, steps_count, weight, source, target):
@@ -131,10 +162,33 @@ class NeuralOC:
           t_ = t_ + dt
           return (t_, x_, key_), x_
         
+        # def solve_ode(state, x):
+        #   noise = jax.random.normal(shape=x.shape, key=key)
+        #   def vector_field(t, y, dsdx_fn):
+        #     u = dsdx_fn(state.params, jnp.array(t)[None], y, y)
+        #     #At_T = self.flow.compute_inverse_control_matrix(t_, x_).transpose()
+        #     #U_t = self.flow.compute_potential(t, y)
+        #     sigma = self.flow.compute_sigma_t(t)
+        #     return -u - sigma * noise
+
+        #   dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
+        #   ode_term = diffrax.ODETerm(vector_field)
+        #   result = diffrax.diffeqsolve(
+        #       ode_term,
+        #       t0=0,
+        #       t1=1,
+        #       y0=x,
+        #       args=dsdx_fn,
+        #       solver=diffrax.Heun(),
+        #       dt0=0.1,
+        #   )
+        #   return None, result.ys
+        
         _, result = jax.lax.scan(move, (t_0, x_0, key), None, length=steps_count)
+        #_, result = jax.jit(jax.vmap(solve_ode, in_axes=(None, 0), out_axes=1))(self.state, x_0)
         x_1_pred = jax.lax.stop_gradient(result[-1])
 
-        dual_loss = -(-state.apply_fn(params, t_1, x_1, x_0 * 0) + state.apply_fn(params, t_1, x_1_pred, x_0 * 0)).mean()
+        dual_loss = - (-state.apply_fn(params, t_1, x_1, x_0 * 0) + state.apply_fn(params, t_1, x_1_pred, x_0 * 0)).mean()
         reg_loss = 0
 
         # exp. reg
@@ -157,7 +211,7 @@ class NeuralOC:
 
         return (reg_loss + dual_loss)  * weight
 
-      @jax.jit
+      @partial(jax.jit, donate_argnames=('state'))
       def train_step_cost(state, key, source, target):
         grad_fn = jax.value_and_grad(am_loss, argnums=1, has_aux=False)
         loss, grads = grad_fn(state, state.params, key, source, target)
@@ -165,15 +219,18 @@ class NeuralOC:
         
         return state, loss
 
-
-      @jax.jit
+      @partial(jax.jit, donate_argnames=('state'))
+      @partial(shard_map, mesh=self.mesh, in_specs=(P(), P(), P('data', None), P('data', None)),
+               out_specs=(P(), P(), P()))
       def train_step_with_potential(state, key, source, target):
         grad_fn = jax.value_and_grad(am_loss, argnums=1, has_aux=False)
         loss, grads = grad_fn(state, state.params, key, source, target)
+        loss, grads = jax.lax.pmean((loss, grads), axis_name='data')
         state = state.apply_gradients(grads=grads)
         
         grad_fn = jax.value_and_grad(potential_loss, argnums=1, has_aux=False)
-        loss_potential, potential_grads = grad_fn(state, state.params, key, 20, 25, source, target)
+        loss_potential, potential_grads = grad_fn(state, state.params, key, 20, 1, source, target)
+        loss_potential, potential_grads = jax.lax.pmean((loss_potential, potential_grads), axis_name='data')
         state = state.apply_gradients(grads=potential_grads)
         
         return state, loss, loss_potential
@@ -193,24 +250,22 @@ class NeuralOC:
     loop_key = utils.default_prng_key(rng)
     training_logs = {"cost_loss": [], "potential_loss": []}
 
-    pbar = tqdm(loader, total=n_iters)
+    pbar = tqdm(loader, total=n_iters, dynamic_ncols=True)
     for it, batch in enumerate(pbar):
-      # batch = jtu.tree_map(jnp.asarray, batch)
-
       src, tgt = batch["src_lin"], batch["tgt_lin"]
       it_key = jax.random.fold_in(loop_key, it)
 
-      if it % 2 != 0:
-        self.state, loss = self.train_step_cost(self.state, it_key, src, tgt)
-      else:
-        self.state, loss, loss_potential = self.train_step_with_potential(self.state, it_key, src, tgt)
-        training_logs["potential_loss"].append(loss_potential)
+      # if it % 4 != 0:
+      #   self.state, loss = self.train_step_cost(self.state, it_key, src, tgt)
+      # else:
+      self.state, loss, loss_potential = self.train_step_with_potential(self.state, it_key, src, tgt)
+      training_logs["potential_loss"].append(loss_potential)
 
       if (it % 500) == 0:
         pbar.set_postfix({"Loss": float(loss)})
       training_logs["cost_loss"].append(loss)
       
-      if it % 5000 == 0 and it > 0 and callback is not None:
+      if (it % 5000 == 0) and (it > 0) and (callback is not None):
         callback(it, training_logs, self.transport)
 
       if it >= n_iters:
@@ -231,13 +286,13 @@ class NeuralOC:
     loop_key = jax.random.PRNGKey(0)
     
     def solve_ode(state, x):
-      def vector_field(t, y, args):
-        dsdx_fn, key_s = args
+      noise = jax.random.normal(shape=x.shape, key=loop_key)
+      def vector_field(t, y, dsdx_fn):
         u = dsdx_fn(state.params, jnp.array(t)[None], y, y)
         #At_T = self.flow.compute_inverse_control_matrix(t_, x_).transpose()
         #U_t = self.flow.compute_potential(t, y)
         sigma = self.flow.compute_sigma_t(t)
-        return -(u + sigma * jax.random.normal(key_s, shape=y.shape))
+        return -u - sigma * noise
 
       dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
       ode_term = diffrax.ODETerm(vector_field)
@@ -247,29 +302,35 @@ class NeuralOC:
           t0=0,
           t1=1,
           y0=x,
-          args=(dsdx_fn, loop_key),
-          solver=diffrax.Tsit5(),
-          dt0=dt,
+          args=dsdx_fn,
+          solver=diffrax.Dopri5(),
+          dt0=0.1,
           saveat=saveat,
           **kwargs,
       )
       return None, result.ys
-      # def move(carry, _):
-      #   t_, x_, cost, key_ = carry
-      #   u = dsdx_fn(state.params, t_ * jnp.ones([x.shape[0],1]), x_, x_)
-      #   At_T = self.flow.compute_inverse_control_matrix(t_, x_).transpose()
-      #   U_t = self.flow.compute_potential(t_, x_)
-      #   sigma = self.flow.compute_sigma_t(t_)
-      #   key_, key_s = jax.random.split(key_)
-      #   x_ = x_ - dt * (u @ At_T + sigma * jax.random.normal(key_s, shape=x_.shape))
-      #   t_ = t_ + dt
-      #   cost += (0.5 * ((u @ At_T) * u).sum(-1).mean() * dt + self.potential_weight *U_t).mean() * dt
-      #   return (t_, x_, cost, key_), x_
-          
-      # (_, _, cost, _), result = jax.lax.scan(move, (t_0, x, 0.0, loop_key), None, length=n)
-      # return cost, result
     
-    #cost, result = jax.jit(solve_ode)(self.state, x)
+    # @jax.jit
+    # def inference(state, x_0):
+
+    #   dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
+      
+    #   def move(carry, _):
+    #     t_, x_, cost, key_ = carry
+    #     u = dsdx_fn(state.params, t_ * jnp.ones([x.shape[0],1]), x_, x_0)
+    #     At_T = self.flow.compute_inverse_control_matrix(t_, x_).transpose()
+    #     U_t = self.flow.compute_potential(t_, x_)
+    #     sigma = self.flow.compute_sigma_t(t_)
+    #     key_, key_s = jax.random.split(key_)
+    #     x_ = x_ - dt * u @ At_T + sigma * jax.random.normal(key_s, shape=x_.shape) * dt
+    #     t_ = t_ + dt
+    #     cost += 0.5 * ((u @ At_T) * u).sum(-1).mean() * dt + U_t.mean() * dt * self.potential_weight
+    #     return (t_, x_, cost, key_), x_
+          
+    #   (_, _, cost, _), result = jax.lax.scan(move, (t_0, x_0, 0.0, loop_key), None, length=n)
+    #   return cost, result
+    
+    # cost, result = inference(self.state, x)
     cost, result = jax.jit(jax.vmap(solve_ode, in_axes=(None, 0), out_axes=1))(self.state, x)
     x_seq = [TimedX(t=t_0, x=x)]
 
@@ -280,3 +341,31 @@ class NeuralOC:
     
     x_seq = jax.lax.scan(compute_timesteps, init=(t_0, 0), length=n)[1]
     return cost, x_seq
+
+
+
+# def solve_ode(state, x):
+#       noise = jax.random.normal(shape=x.shape, key=loop_key)
+#       def vector_field(t, y, dsdx_fn):
+#         u = dsdx_fn(state.params, jnp.array(t)[None], y, y)
+#         #At_T = self.flow.compute_inverse_control_matrix(t_, x_).transpose()
+#         #U_t = self.flow.compute_potential(t, y)
+#         sigma = self.flow.compute_sigma_t(t)
+#         return -u - sigma * noise
+
+#       dsdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=2)
+#       ode_term = diffrax.ODETerm(vector_field)
+#       saveat = diffrax.SaveAt(ts=jnp.linspace(0, 1, n))
+#       result = diffrax.diffeqsolve(
+#           ode_term,
+#           t0=0,
+#           t1=1,
+#           y0=x,
+#           args=dsdx_fn,
+#           solver=diffrax.Dopri5(),
+#           dt0=0.1,
+#           saveat=saveat,
+#           stepsize_controller=diffrax.PIDController(rtol=1e-5, atol=1e-5),
+#           **kwargs,
+#       )
+#       return None, result.ys

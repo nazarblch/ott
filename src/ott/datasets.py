@@ -18,6 +18,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from functools import partial
+
 __all__ = ["create_gaussian_mixture_samplers", "Dataset", "GaussianMixture"]
 
 from ott import utils
@@ -144,3 +146,114 @@ def create_gaussian_mixture_samplers(
   )
   dim_data = 2
   return train_dataset, valid_dataset, dim_data
+
+class LSBLine:
+    def __init__(self, size):
+        self.size = size
+
+    def __iter__(self):
+        rng = jax.random.PRNGKey(42)
+        while True:
+            rng, sample_key = jax.random.split(rng, 2)
+            yield LSBLine._sample(sample_key, self.size)
+
+    @staticmethod
+    @partial(jax.jit, static_argnums=(1,))
+    def _sample(key, batch_size):
+        k1, k2, key = jax.random.split(key, 3)
+        x1 = jax.random.uniform(k1, (batch_size, 1), minval=-1.25, maxval=-1.0)
+        x2 = jax.random.uniform(k2, (batch_size, 1), minval=-1.0, maxval=1.0)
+        x_0 = jnp.concatenate([x1, x2], axis=1)
+        
+        k1, k2, key = jax.random.split(key, 3)
+        x1 = jax.random.uniform(k1, (batch_size, 1), minval=1, maxval=1.25)
+        x2 = jax.random.uniform(k2, (batch_size, 1), minval=-1.0, maxval=1.0)
+        x_1 = jnp.concatenate([x1, x2], axis=1)
+
+        return {
+            "src_lin": x_0,
+            "tgt_lin": x_1
+        }
+
+def create_lsb_line_samplers(key, batch_size, scale:int=1):
+    def source_generator(key):
+        while True:
+            k1, k2, key = jax.random.split(key, 3)
+            x1 = jax.random.uniform(k1, (batch_size, 1), minval=-1.25, maxval=-1.0) * scale
+            x2 = jax.random.uniform(k2, (batch_size, 1), minval=-1.0, maxval=1.0) * scale
+            x = jnp.concatenate([x1, x2], axis=1)
+            yield x
+
+    def target_generator(key):
+        while True:
+            k1, k2, key = jax.random.split(key, 3)
+            x1 = jax.random.uniform(k1, (batch_size, 1), minval=1, maxval=1.25) * scale
+            x2 = jax.random.uniform(k2, (batch_size, 1), minval=-1.0, maxval=1.0) * scale
+            x = jnp.concatenate([x1, x2], axis=1)
+            yield x
+
+    k1, k2, key = jax.random.split(key, 3)
+    source_sampler = iter(source_generator(k1))
+    target_sampler = iter(target_generator(k2))
+    return source_sampler, target_sampler
+
+@dataclasses.dataclass
+class Gaussian:
+    source_mean: float
+    source_var: float
+
+    target_mean: float
+    target_var: float
+
+    batch_size: int
+    init_key: jax.random.PRNGKey
+
+    def __iter__(self) -> Iterator[jnp.array]:
+        """Random sample generator from Gaussian mixture.
+        Returns:
+        A generator of samples from the Gaussian mixture.
+        """
+        return self._create_sample_generators()
+
+    def _create_sample_generators(self) -> Iterator[jnp.array]:
+        key = self.init_key
+        while True:
+            key1, key2, key = jax.random.split(key, 3)
+            source_normal_samples = jax.random.normal(key1, [self.batch_size, 2])
+            source_samples = self.source_mean + self.source_var**2 * source_normal_samples
+
+            target_normal_samples = jax.random.normal(key2, [self.batch_size, 2])
+            target_samples = self.target_mean + self.target_var**2 * target_normal_samples
+
+            yield {"src_lin": source_samples, 'tgt_lin': target_samples}
+
+def create_gsb(geometry_str: str, batch_size: int, key):
+  if "sq_euclidean" in geometry_str:
+    variance = 0.5
+    source_mean = jnp.array([-1.0, 0.0])
+    target_mean = jnp.array([0.0, 1.0])
+  elif geometry_str == "scarvelis_circle":
+    variance = 0.3
+    source_mean = jnp.array([-1.0, 0.0])
+    target_mean = jnp.array([1.0, 0.0])
+  elif geometry_str == "gsb_vneck":
+    variance = 0.2
+    source_mean = jnp.array([-7.0, 0.0])
+    target_mean = jnp.array([7.0, 0.0])
+  elif geometry_str == "gsb_stunnel":
+    variance = 0.5
+    source_mean = jnp.array([-11.0, -1.0])
+    target_mean = jnp.array([11.0, -1.0])
+
+  # source_sampler = iter(
+  #     Gaussian(
+  #         'src_lin', batch_size=batch_size, init_key=k1, mean=source_mean, variance=variance
+  #     )
+  # )
+  # target_sampler = iter(
+  #     Gaussian(
+  #         'tgt_lin', batch_size=batch_size, init_key=k2, mean=target_mean, variance=variance
+  #     )
+  # )
+  return Gaussian(source_mean=source_mean, source_var=variance,
+                  target_mean=target_mean, target_var=variance, batch_size=batch_size, init_key=key)
