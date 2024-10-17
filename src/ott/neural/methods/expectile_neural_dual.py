@@ -30,6 +30,9 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn
 from flax.core import frozen_dict
+from flax import nnx, struct
+
+from flax.nnx import bridge
 
 from ott import utils
 from ott.geometry import costs
@@ -98,9 +101,13 @@ class ENOTPotentials(dual_potentials.DualPotentials):
         "is_bidirectional": self.is_bidirectional,
         "corr": self._corr
     }
+  
 
+class PotentialTrainState(nnx.helpers.TrainState):
+  other_variables: nnx.State
+  
 
-class PotentialModelWrapper(potentials.BasePotential):
+class PotentialModelWrapper(nnx.Module):
   """Wrapper class for the neural models.
 
   Implements a potential value or a vector field.
@@ -111,12 +118,20 @@ class PotentialModelWrapper(potentials.BasePotential):
     is_potential: Model the potential if ``True``, otherwise
       model the gradient of the potential.
   """
+  def __init__(self, 
+              model: nn.Module,
+              add_l2_norm: bool,
+              seed: int,
+              input: Union[int, Tuple[int, ...]],
+              is_potential: bool = True,
+              ):
 
-  model: nn.Module
-  add_l2_norm: bool
-  is_potential: bool = True
+    self.is_potential = is_potential
+    self.add_l2_norm = add_l2_norm
+    self.model = bridge.ToNNX(model,
+                      rngs=nnx.Rngs(seed, dropout=seed))
+    bridge.lazy_init(self.model, jnp.ones(input))
 
-  @nn.compact
   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
     """Apply model and optionally add l2 norm or x."""
     z: jnp.ndarray = self.model(x)
@@ -129,14 +144,27 @@ class PotentialModelWrapper(potentials.BasePotential):
 
     return z
 
-  def potential_gradient_fn(
-      self, params: frozen_dict.FrozenDict[str, jnp.ndarray]
-  ) -> potentials.PotentialGradientFn_t:
+  def potential_gradient_fn(self, x) -> jnp.ndarray:
     """A vector function or gradient of the potential."""
     if self.is_potential:
-      return jax.grad(self.potential_value_fn(params))
-    return lambda x: self.apply({"params": params}, x)
+      return nnx.grad(lambda y: self.__call__(y).sum())(x)
+    return self.__call__(x)
 
+  def potential_value_fn(self, x) -> jnp.ndarray:
+    """Value of the potential."""
+    return self.__call__(x)
+
+  def create_train_state(
+      self,
+      optimizer: optax.OptState,
+      **kwargs: Any,
+  ) -> PotentialTrainState:
+    """Create initial training state."""
+
+    graph, model_params, model_stats = nnx.split(self, nnx.Param, ...)
+    state = PotentialTrainState.create(graph, params=model_params, other_variables=model_stats, tx=optimizer)
+    return state
+  
 
 class ExpectileNeuralDual:
   r"""Expectile-regularized Neural Optimal Transport (ENOT) :cite:`buzun:24`.
@@ -258,24 +286,26 @@ class ExpectileNeuralDual:
           dim_hidden=[128, 128, 128, 128, 1], act_fn=jax.nn.elu
       )
 
-    self.neural_f = PotentialModelWrapper(
-        model=neural_f,
-        is_potential=is_bidirectional,
-        add_l2_norm=self.use_dot_product
-    )
-    self.neural_g = PotentialModelWrapper(
-        model=neural_g, is_potential=True, add_l2_norm=self.use_dot_product
-    )
-
     rng = utils.default_prng_key(rng)
     rng_f, rng_g = jax.random.split(rng, 2)
 
-    self.state_f = self.neural_f.create_train_state(
-        rng_f, optimizer_f, (dim_data,)
+    self.neural_f = PotentialModelWrapper(
+        model=neural_f,
+        is_potential=is_bidirectional,
+        add_l2_norm=self.use_dot_product,
+        seed=int(rng_f[1]),
+        input=dim_data,
     )
-    self.state_g = self.neural_g.create_train_state(
-        rng_g, optimizer_g, (dim_data,)
+
+    self.neural_g = PotentialModelWrapper(
+        model=neural_g, is_potential=True, 
+        add_l2_norm=self.use_dot_product,
+        seed=int(rng_g[1]),
+        input=dim_data,
     )
+
+    self.state_f = self.neural_f.create_train_state(optimizer_f)
+    self.state_g = self.neural_g.create_train_state(optimizer_g)
 
     self.train_step = self._get_train_step()
     self.valid_step = self._get_valid_step()
@@ -365,18 +395,22 @@ class ExpectileNeuralDual:
 
     @jax.jit
     def step_fn(state_f, state_g, batch):
-      grad_fn = jax.value_and_grad(self._loss_fn, argnums=[0, 1], has_aux=True)
+      model_f = nnx.merge(state_f.graphdef, state_f.params, state_f.other_variables)
+      model_g = nnx.merge(state_g.graphdef, state_g.params, state_g.other_variables)
+      grad_fn = nnx.value_and_grad(self._loss_fn, argnums=[0, 1], has_aux=True)
       (loss, (loss_f, loss_g, w_dist)), (grads_f, grads_g) = grad_fn(
-          state_f.params,
-          state_g.params,
-          state_f.potential_gradient_fn,
-          state_g.potential_value_fn,
+          model_f,
+          model_g,
           batch,
       )
 
+      _, _, model_f_stats = nnx.split(model_f, nnx.Param, ...)
+      _, _, model_g_stats = nnx.split(model_g, nnx.Param, ...)
+
       return (
-          state_f.apply_gradients(grads=grads_f),
-          state_g.apply_gradients(grads=grads_g), loss, loss_f, loss_g, w_dist
+          state_f.apply_gradients(grads=grads_f, other_variables=model_f_stats),
+          state_g.apply_gradients(grads=grads_g, other_variables=model_g_stats), 
+          loss, loss_f, loss_g, w_dist
       )
 
     return step_fn
@@ -390,11 +424,11 @@ class ExpectileNeuralDual:
 
     @jax.jit
     def step_fn(state_f, state_g, batch):
+      model_f = nnx.merge(state_f.graphdef, state_f.params, state_f.other_variables)
+      model_g = nnx.merge(state_g.graphdef, state_g.params, state_g.other_variables)
       loss, (loss_f, loss_g, w_dist) = self._loss_fn(
-          state_f.params,
-          state_g.params,
-          state_f.potential_gradient_fn,
-          state_g.potential_value_fn,
+          model_f,
+          model_g,
           batch,
       )
 
@@ -440,25 +474,21 @@ class ExpectileNeuralDual:
     return w_dist
 
   def _loss_fn(
-      self, params_f: frozen_dict.FrozenDict[str, jnp.ndarray],
-      params_g: frozen_dict.FrozenDict[str, jnp.ndarray],
-      gradient_f: Callable[[frozen_dict.FrozenDict[str, jnp.ndarray]],
-                           potentials.PotentialGradientFn_t],
-      g_value: Callable[[frozen_dict.FrozenDict[str, jnp.ndarray]],
-                        potentials.PotentialValueFn_t], batch: Dict[str,
-                                                                    jnp.ndarray]
+      self, model_f: PotentialModelWrapper, model_g: PotentialModelWrapper, batch: Dict[str, jnp.ndarray]
   ) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
 
     source, target = batch["source"], batch["target"]
 
-    g_value_partial, g_value_partial_detach = self._get_g_value_partial(
-        params_g, g_value
-    )
+    g_tmp, g_param_tmp, g_stuff_tmp = nnx.split(model_g, nnx.Param, ...)
+    model_g_detach = nnx.merge(g_tmp, jax.lax.stop_gradient(g_param_tmp), g_stuff_tmp)
+
+    g_value_partial, g_value_partial_detach = model_g.__call__, model_g_detach.__call__ 
+    
     batch_cost = self.train_batch_cost
 
     transport = ENOTPotentials(
-        gradient_f(params_f),
-        g_value(params_g),
+        model_f.potential_gradient_fn, 
+        model_g_detach.potential_value_fn,
         self.cost_fn,
         is_bidirectional=self.is_bidirectional,
         corr=self.use_dot_product
@@ -494,8 +524,12 @@ class ExpectileNeuralDual:
 
   def to_dual_potentials(self) -> ENOTPotentials:
     """Return the Kantorovich dual potentials from the trained potentials."""
-    f_grad_partial = self.state_f.potential_gradient_fn(self.state_f.params)
-    g_value_partial = self.state_g.potential_value_fn(self.state_g.params, None)
+
+    model_f = nnx.merge(self.state_f.graphdef, self.state_f.params, self.state_f.other_variables)
+    model_g = nnx.merge(self.state_g.graphdef, self.state_g.params, self.state_g.other_variables)
+
+    f_grad_partial = model_f.potential_gradient_fn
+    g_value_partial = model_g.potential_value_fn
 
     return ENOTPotentials(
         f_grad_partial,
