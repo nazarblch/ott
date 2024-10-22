@@ -128,13 +128,12 @@ class PotentialModelWrapper(nnx.Module):
 
     self.is_potential = is_potential
     self.add_l2_norm = add_l2_norm
-    self.model = bridge.ToNNX(model,
-                      rngs=nnx.Rngs(seed, dropout=seed))
-    bridge.lazy_init(self.model, jnp.ones(input))
+    self.model = bridge.ToNNX(model, rngs=nnx.Rngs(seed, dropout=seed)).lazy_init(jnp.ones(input))
+    # bridge.lazy_init(self.model, jnp.ones(input))
 
   def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
     """Apply model and optionally add l2 norm or x."""
-    z: jnp.ndarray = self.model(x)
+    z: jnp.ndarray = self.model(x, mutable=['batch_stats'])
 
     if self.is_potential:
       z = z.squeeze()
@@ -368,7 +367,10 @@ class ExpectileNeuralDual:
         self._update_logs(train_logs, loss_f, loss_g, w_dist)
 
       if callback is not None:
-        _ = callback(step, self.to_dual_potentials())
+        model_f = nnx.merge(self.state_f.graphdef, self.state_f.params, self.state_f.other_variables)
+        model_f.eval()
+        f_grad_partial = model_f.potential_gradient_fn
+        _ = callback(step, f_grad_partial)
 
       if step != 0 and step % self.valid_freq == 0:
         valid_batch["source"] = jnp.asarray(next(validloader_source))
@@ -397,6 +399,8 @@ class ExpectileNeuralDual:
     def step_fn(state_f, state_g, batch):
       model_f = nnx.merge(state_f.graphdef, state_f.params, state_f.other_variables)
       model_g = nnx.merge(state_g.graphdef, state_g.params, state_g.other_variables)
+      model_f.train()
+      model_g.train()
       grad_fn = nnx.value_and_grad(self._loss_fn, argnums=[0, 1], has_aux=True)
       (loss, (loss_f, loss_g, w_dist)), (grads_f, grads_g) = grad_fn(
           model_f,
@@ -441,24 +445,6 @@ class ExpectileNeuralDual:
     weight = jnp.where(diff >= 0, self.expectile, (1 - self.expectile))
     return weight * diff ** 2
 
-  def _get_g_value_partial(
-      self, params_g: frozen_dict.FrozenDict[str, jnp.ndarray],
-      g_value: Callable[[frozen_dict.FrozenDict[str, jnp.ndarray]],
-                        potentials.PotentialValueFn_t]
-  ):
-
-    if self.use_dot_product:
-      g_value_partial = lambda y: -jax.vmap(g_value(params_g))(y)
-      g_value_partial_detach = \
-          lambda y: -jax.vmap(g_value(jax.lax.stop_gradient(params_g)))(y)
-    else:
-      g_value_partial = jax.vmap(g_value(params_g))
-      g_value_partial_detach = jax.vmap(
-          g_value(jax.lax.stop_gradient(params_g))
-      )
-
-    return g_value_partial, g_value_partial_detach
-
   def _distance(
       self, source: jnp.ndarray, target: jnp.ndarray, f_source: jnp.ndarray,
       g_target: jnp.ndarray
@@ -486,13 +472,14 @@ class ExpectileNeuralDual:
     
     batch_cost = self.train_batch_cost
 
-    transport = ENOTPotentials(
-        model_f.potential_gradient_fn, 
-        model_g_detach.potential_value_fn,
-        self.cost_fn,
-        is_bidirectional=self.is_bidirectional,
-        corr=self.use_dot_product
-    ).transport
+    # transport = ENOTPotentials(
+    #     model_f.potential_gradient_fn, 
+    #     model_g_detach.potential_value_fn,
+    #     self.cost_fn,
+    #     is_bidirectional=self.is_bidirectional,
+    #     corr=self.use_dot_product
+    # ).transport
+    transport = model_f.potential_gradient_fn
 
     target_hat = transport(source)
     target_hat_detach = jax.lax.stop_gradient(target_hat)
@@ -527,6 +514,8 @@ class ExpectileNeuralDual:
 
     model_f = nnx.merge(self.state_f.graphdef, self.state_f.params, self.state_f.other_variables)
     model_g = nnx.merge(self.state_g.graphdef, self.state_g.params, self.state_g.other_variables)
+    model_f.eval()
+    model_g.eval()
 
     f_grad_partial = model_f.potential_gradient_fn
     g_value_partial = model_g.potential_value_fn
