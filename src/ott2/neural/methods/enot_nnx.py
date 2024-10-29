@@ -1,3 +1,16 @@
+# Copyright OTT-JAX
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from typing import (
     Any,
     Callable,
@@ -21,10 +34,10 @@ from flax import nnx, struct
 
 from flax.nnx import bridge
 
-from ott import utils
-from ott.geometry import costs
-from ott.neural.networks import potentials
-from ott.problems.linear import potentials as dual_potentials
+from ott2 import utils
+from ott2.geometry import costs
+from ott2.neural.networks import potentials
+from ott2.problems.linear import potentials as dual_potentials
 
 __all__ = ["ENOTPotentials", "PotentialModelWrapper", "ExpectileNeuralDual"]
 
@@ -32,8 +45,7 @@ Train_t = Dict[Literal["train_logs", "valid_logs"], Dict[str, List[float]]]
 Callback_t = Callable[[int, dual_potentials.DualPotentials], None]
 
 
-@jax.tree_util.register_pytree_node_class
-class ENOTPotentials(dual_potentials.DualPotentials):
+class ENOTPotentials(nnx.Module):
   """The dual potentials of the ENOT method :cite:`buzun:24`.
 
   Args:
@@ -46,50 +58,48 @@ class ENOTPotentials(dual_potentials.DualPotentials):
   """
 
   def __init__(
-      self, grad_f: potentials.PotentialGradientFn_t,
-      g: potentials.PotentialValueFn_t, cost_fn: costs.CostFn, *,
+      self, 
+      model_f: nnx.Module,
+      model_g: nnx.Module, 
+      cost_fn: costs.CostFn, *,
       is_bidirectional: bool, corr: bool
   ):
-    self.__grad_f = grad_f
+    self.model_f = model_f
+    self.model_g = model_g
+    self.cost_fn = cost_fn
     self.is_bidirectional = is_bidirectional
+    self._corr = corr
 
-    def g_cost_conjugate(x: jnp.ndarray) -> jnp.ndarray:
-      if is_bidirectional and not corr:
-        y_hat = cost_fn.twist_operator(x, grad_f(x), False)
-      else:
-        y_hat = grad_f(x)
-      y_hat = jax.lax.stop_gradient(y_hat)
+  def g_cost_conjugate(self, x: jnp.ndarray) -> jnp.ndarray:
+    if self.is_bidirectional and not self._corr:
+      y_hat = self.cost_fn.twist_operator(x, self.model_f.potential_gradient_fn(x, train=False), False)
+    else:
+      y_hat = self.model_f.potential_gradient_fn(x, train=False)
+    y_hat = jax.lax.stop_gradient(y_hat)
 
-      return -g(y_hat) + (jnp.dot(x, y_hat) if corr else cost_fn(x, y_hat))
-
-    super().__init__(g_cost_conjugate, g, cost_fn=cost_fn, corr=corr)
-
-  @property
-  def _grad_f(self) -> Callable[[jnp.ndarray], jnp.ndarray]:
-    return jax.vmap(self.__grad_f)
+    return -self.model_g(y_hat, train=False) + (jnp.dot(x, y_hat) if self._corr else self.cost_fn(x, y_hat))
+    
+  def distance(self, src: jnp.ndarray, tgt: jnp.ndarray) -> float:
+    src, tgt = jnp.atleast_2d(src), jnp.atleast_2d(tgt)
+    f = jax.vmap(self.g_cost_conjugate)
+    g = jax.vmap(lambda x_: self.model_g(x_, train=False))
+    out = jnp.mean(f(src)) + jnp.mean(g(tgt))
+    if self._corr:
+      out = -2.0 * out + jnp.mean(jnp.sum(src ** 2, axis=-1))
+      out += jnp.mean(jnp.sum(tgt ** 2, axis=-1))
+    return out
 
   def transport(  # noqa: D102
       self,
       vec: jnp.ndarray,
       forward: bool = True
   ) -> jnp.ndarray:
-    if self.is_bidirectional:
-      return super().transport(vec, forward)
+    
     vec = jnp.atleast_2d(vec)
     assert forward, "Only forward mapping (source -> target) is supported."
-    return self._grad_f(vec)
+    return self.model_f.potential_gradient_fn(vec, train=False)
 
-  def tree_flatten(self) -> Tuple[Sequence[Any], Dict[str, Any]]:
-    """Flatten the kwargs."""
-    return [], {
-        "grad_f": self.__grad_f,
-        "g": self._g,
-        "cost_fn": self.cost_fn,
-        "is_bidirectional": self.is_bidirectional,
-        "corr": self._corr
-    }
   
-
 class PotentialTrainState(nnx.helpers.TrainState):
   other_variables: nnx.State
   
@@ -115,13 +125,16 @@ class PotentialModelWrapper(nnx.Module):
 
     self.is_potential = is_potential
     self.add_l2_norm = add_l2_norm
-    self.model = bridge.ToNNX(model, rngs=nnx.Rngs(seed, dropout=seed)).lazy_init(jnp.ones(input))
-    # bridge.lazy_init(self.model, jnp.ones(input))
+    if isinstance(model, nnx.Module):
+      self.model = model
+    else:
+      self.model = bridge.ToNNX(model, rngs=nnx.Rngs(seed, dropout=seed)).lazy_init(jnp.ones(input))
 
-  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+  def __call__(self, x: jnp.ndarray, train=True) -> jnp.ndarray:
     """Apply model and optionally add l2 norm or x."""
-    z: jnp.ndarray = self.model(x, mutable=['batch_stats'])
-
+    
+    z: jnp.ndarray = self.model(x)
+    
     if self.is_potential:
       z = z.squeeze()
 
@@ -130,15 +143,15 @@ class PotentialModelWrapper(nnx.Module):
 
     return z
 
-  def potential_gradient_fn(self, x) -> jnp.ndarray:
+  def potential_gradient_fn(self, x, train=True) -> jnp.ndarray:
     """A vector function or gradient of the potential."""
     if self.is_potential:
-      return nnx.grad(lambda y: self.__call__(y).sum())(x)
-    return self.__call__(x)
+      return nnx.grad(lambda y: self.__call__(y, train).sum())(x)
+    return self.__call__(x, train)
 
-  def potential_value_fn(self, x) -> jnp.ndarray:
+  def potential_value_fn(self, x, train=True) -> jnp.ndarray:
     """Value of the potential."""
-    return self.__call__(x)
+    return self.__call__(x, train)
 
   def create_train_state(
       self,
@@ -253,7 +266,7 @@ class ExpectileNeuralDual:
     if use_dot_product:
       self.train_batch_cost = lambda x, y: -jax.vmap(jnp.dot)(x, y)
     else:
-      self.train_batch_cost = self.cost_fn
+      self.train_batch_cost = jax.vmap(self.cost_fn)
 
     # set default optimizers
     if optimizer_f is None:
@@ -354,10 +367,7 @@ class ExpectileNeuralDual:
         self._update_logs(train_logs, loss_f, loss_g, w_dist)
 
       if callback is not None:
-        model_f = nnx.merge(self.state_f.graphdef, self.state_f.params, self.state_f.other_variables)
-        model_f.eval()
-        f_grad_partial = model_f.potential_gradient_fn
-        _ = callback(step, f_grad_partial)
+        _ = callback(step, self.to_dual_potentials())
 
       if step != 0 and step % self.valid_freq == 0:
         valid_batch["source"] = jnp.asarray(next(validloader_source))
@@ -504,12 +514,9 @@ class ExpectileNeuralDual:
     model_f.eval()
     model_g.eval()
 
-    f_grad_partial = model_f.potential_gradient_fn
-    g_value_partial = model_g.potential_value_fn
-
     return ENOTPotentials(
-        f_grad_partial,
-        g_value_partial,
+        model_f,
+        model_g,
         self.cost_fn,
         is_bidirectional=self.is_bidirectional,
         corr=self.use_dot_product

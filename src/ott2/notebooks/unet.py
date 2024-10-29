@@ -86,6 +86,9 @@ class UNet(nn.Module):
 
     @nn.compact
     def __call__(self, x, train=True):
+
+        mutable = self.is_mutable_collection('batch_stats')
+        train = mutable
         
         D = self.image_size
         x = x.reshape(-1, 3, D, D).transpose(0, 2, 3, 1)

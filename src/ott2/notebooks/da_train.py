@@ -21,15 +21,16 @@ import jax
 from jax import numpy as jnp
 import matplotlib.pyplot as plt
 from IPython.display import clear_output, display
-from ott2.neural.methods.expectile_neural_dual import ExpectileNeuralDual
+from ott2.neural.methods.enot_nnx import ExpectileNeuralDual
 from ott2.geometry import costs
 from ott2.notebooks.resnet import ResNet_D
-from ott2.notebooks.unet import UNet2, UNet
+from ott2.notebooks.unet_nnx import UNet
 import optax
 import os
 import gc
 import jax_inception as inception
 import functools
+from flax import nnx
 
 print(jax.devices())
 
@@ -88,13 +89,12 @@ def to_img(x):
     return x
 
 
-mu_data, sigma_data = get_loader_stats(test_target.loader, batch_size=128, n_epochs=1, verbose=True)
-
 inception_net = inception.InceptionV3(pretrained=True)
 rng = jax.random.PRNGKey(0)
 inception_params = inception_net.init(rng, jnp.ones((1, 299, 299, 3)))
-inception_apply = jax.jit(functools.partial(inception_net.apply, train=False))
+inception_apply = nnx.jit(functools.partial(inception_net.apply, train=False))
 
+mu_data, sigma_data = get_loader_stats(test_target.loader, inception_apply, inception_params, batch_size=128, n_epochs=1, verbose=True)
 
 from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter("/home/nazar/pomoika/enot_0.98")
@@ -134,21 +134,21 @@ def training_callback(step, learned_potentials):
 
 print("init")
 
-neural_f = UNet(image_size, 3, 3, 48)
-neural_g = ResNet_D(image_size, nfilter=48, nlayers=4)
+neural_f = UNet(nnx.Rngs(0), image_size, 3, 3, 48 * 2)
+neural_g = ResNet_D(image_size, nfilter=48 * 2, nlayers=4)
 
-num_train_iters = 150_100
+num_train_iters = 200_100
 
 lr_schedule_f = optax.cosine_decay_schedule(
-    init_value=5e-5, decay_steps=num_train_iters, alpha=1e-2
+    init_value=1e-4, decay_steps=num_train_iters, alpha=1e-2
 )
 
 lr_schedule_g = optax.cosine_decay_schedule(
     init_value=5e-5, decay_steps=num_train_iters, alpha=1e-2
 )
 
-optimizer_f = optax.adamw(learning_rate=lr_schedule_f, b1=0.5, b2=0.5)
-optimizer_g = optax.adamw(learning_rate=lr_schedule_g, b1=0.5, b2=0.5)
+optimizer_f = optax.adamw(learning_rate=lr_schedule_f, b1=0.5, b2=0.5, eps=1e-6)
+optimizer_g = optax.adamw(learning_rate=lr_schedule_g, b1=0.5, b2=0.5, eps=1e-6)
 
 print("init ot")
 
@@ -232,11 +232,11 @@ neural_dual_solver = ExpectileNeuralDual(
     optimizer_g,
     cost_fn=MSECost(),
     num_train_iters=num_train_iters,
-    expectile=0.99,
+    expectile=0.98,
     expectile_loss_coef=1.0,
     rng=jax.random.PRNGKey(5),
     is_bidirectional=False,
-    start_step=0
+    # start_step=0
     # use_dot_product=True
 )
 

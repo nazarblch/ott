@@ -129,16 +129,16 @@ def load_dataset(name, path, img_size=64, batch_size=64, device='cuda'):
             train_set, test_set = Subset(dataset, train_idx), Subset(dataset, test_idx)
     
     if not name in ['aim19', 'celeba_female_subset', 'aligned_anime_faces_subset']:
-        train_sampler = LoaderSampler(DataLoader(train_set, shuffle=True, batch_size=batch_size), device)
+        train_sampler = LoaderSampler(DataLoader(train_set, shuffle=True, num_workers=4, batch_size=batch_size), device)
         test_sampler = LoaderSampler(DataLoader(test_set, shuffle=False, batch_size=batch_size), device)
         return train_sampler, test_sampler
     elif name in ['celeba_female_subset', 'aligned_anime_faces_subset']:
-        train_sampler = LoaderSampler(DataLoader(train_set, shuffle=False,  batch_size=batch_size), device)
+        train_sampler = LoaderSampler(DataLoader(train_set, shuffle=True, num_workers=4,  batch_size=batch_size), device)
         test_sampler = LoaderSampler(DataLoader(test_set, shuffle=False,  batch_size=batch_size), device)
         return train_sampler, test_sampler
     else:
-        train_lr_sampler = LoaderSampler(DataLoader(train_lr_set, shuffle=True,  batch_size=batch_size), device)
-        train_hr_sampler = LoaderSampler(DataLoader(train_hr_set, shuffle=True,  batch_size=batch_size), device)
+        train_lr_sampler = LoaderSampler(DataLoader(train_lr_set, shuffle=True, num_workers=4, batch_size=batch_size), device)
+        train_hr_sampler = LoaderSampler(DataLoader(train_hr_set, shuffle=True, num_workers=4, batch_size=batch_size), device)
         test_lr_sampler = LoaderSampler(DataLoader(test_lr_set, shuffle=False,  batch_size=batch_size), device)
         test_hr_sampler = LoaderSampler(DataLoader(test_hr_set, shuffle=False,  batch_size=batch_size), device)
         return train_lr_sampler, train_hr_sampler, test_lr_sampler, test_hr_sampler
@@ -241,11 +241,11 @@ def calculate_cost(T, loader, cost_type='mse', verbose=False, upgrade=False):
     gc.collect(); torch.cuda.empty_cache()
     return cost
 
-def get_loader_stats(loader, batch_size=8, n_epochs=1, verbose=False, classes=True):
+def get_loader_stats(loader, inception_fn, inception_params, batch_size=8, n_epochs=1, verbose=False, classes=True):
     dims = 2048
-    block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
-    model = InceptionV3([block_idx]).cuda()
-    freeze(model)
+    # block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+    # model = InceptionV3([block_idx]).cuda()
+    # freeze(model)
     
     size = len(loader.dataset)
     pred_arr = []
@@ -256,14 +256,18 @@ def get_loader_stats(loader, batch_size=8, n_epochs=1, verbose=False, classes=Tr
                 for step, (X, Y) in enumerate(loader) if not verbose else tqdm(enumerate(loader)):
                     for i in range(0, len(X), batch_size):
                         start, end = i, min(i + batch_size, len(X))
-                        batch = ((X[start:end] + 1) / 2).type(torch.FloatTensor).cuda()
-                        pred_arr.append(model(batch)[0].cpu().data.numpy().reshape(end-start, -1))
+                        batch = ((X[start:end] + 1) / 2).type(torch.FloatTensor).numpy()
+                        # pred_arr.append(model(batch)[0].cpu().data.numpy().reshape(end-start, -1))
+                        batch = batch.transpose(0, 2, 3, 1)
+                        pred_arr.append(np.asarray(inception_fn(inception_params, batch)).reshape(end-start, -1))
             else:
                 for step, X in enumerate(loader) if not verbose else tqdm(enumerate(loader)):
                     for i in range(0, len(X), batch_size):
                         start, end = i, min(i + batch_size, len(X))
-                        batch = ((X[start:end] + 1) / 2).type(torch.FloatTensor).cuda()
-                        pred_arr.append(model(batch)[0].cpu().data.numpy().reshape(end-start, -1))
+                        batch = ((X[start:end] + 1) / 2).type(torch.FloatTensor).numpy()
+                        # pred_arr.append(model(batch)[0].cpu().data.numpy().reshape(end-start, -1))
+                        batch = batch.transpose(0, 2, 3, 1)
+                        pred_arr.append(np.asarray(inception_fn(inception_params, batch)).reshape(end-start, -1))
 
     pred_arr = np.vstack(pred_arr)
     mu, sigma = np.mean(pred_arr, axis=0), np.cov(pred_arr, rowvar=False)
@@ -315,9 +319,9 @@ def loader2array(loader, batch_size=64, img_size=16, verbose=False):
 def get_pushed_loader_stats(T, loader, inception_fn, inception_params, batch_size=8, n_epochs=1, verbose=False, device='cuda',
                             use_downloaded_weights=False, upgrade=False):
     dims = 2048
-    block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
-    model = InceptionV3([block_idx], use_downloaded_weights=use_downloaded_weights).to(device)
-    freeze(model); 
+    # block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+    # model = InceptionV3([block_idx], use_downloaded_weights=use_downloaded_weights).to(device)
+    # freeze(model); 
     
     size = len(loader.dataset)
     pred_arr = []

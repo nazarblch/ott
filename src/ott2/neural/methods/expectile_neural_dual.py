@@ -361,15 +361,15 @@ class ExpectileNeuralDual:
         rng_g, optimizer_g, (dim_data,)
     )
 
-    if start_step > -1:
+    if start_step > 0:
       ckptr = PyTreeCheckpointer()
-      ckp_f = ckptr.restore(f"/home/nazar/projects/outputs5.2/{start_step}/state_f")
+      # ckp_f = ckptr.restore(f"/home/nazar/projects/outputs5.2/{start_step}/state_f")
       ckp_g = ckptr.restore(f"/home/nazar/projects/outputs5.2/{start_step}/state_g")
 
       # opt_f = restore_optimizer_state(self.state_f.opt_state, ckp_f['opt_state'])
-      # opt_g = restore_optimizer_state(self.state_g.opt_state, ckp_g['opt_state'])
-      self.state_f = self.state_f.replace(params=ckp_f['params'], batch_stats=ckp_f['batch_stats'])
-      self.state_g = self.state_g.replace(params=ckp_g['params'])
+      opt_g = restore_optimizer_state(self.state_g.opt_state, ckp_g['opt_state'])
+      # self.state_f = self.state_f.replace(params=ckp_f['params'], batch_stats=ckp_f['batch_stats'], opt_state=opt_f)
+      self.state_g = self.state_g.replace(params=ckp_g['params'], opt_state=opt_g)
 
     self.train_step = self._get_train_step()
     self.valid_step = self._get_valid_step()
@@ -417,7 +417,7 @@ class ExpectileNeuralDual:
 
       update_forward = (step % 2 == 0) or not self.is_bidirectional
 
-      # if step % 5000 == 0:
+      # if step % 5000 == 1:
       #   ckptr = PyTreeCheckpointer()
       #   ckptr.save(
       #       f"/home/nazar/projects/outputs5.2/{step}/state_f",
