@@ -40,7 +40,7 @@ class BaseFlow(abc.ABC):
 
   @abc.abstractmethod
   def compute_mu_t(
-      self, t: jnp.ndarray, src: jnp.ndarray, tgt: jnp.ndarray
+      self, t: jnp.ndarray, src: jnp.ndarray, tgt: jnp.ndarray, correction_model
   ) -> jnp.ndarray:
     """Compute the mean of the probability path.
 
@@ -83,7 +83,8 @@ class BaseFlow(abc.ABC):
     """
 
   def compute_xt(
-      self, rng: jax.Array, t: jnp.ndarray, src: jnp.ndarray, tgt: jnp.ndarray
+      self, rng: jax.Array, t: jnp.ndarray, src: jnp.ndarray, tgt: jnp.ndarray,
+      correction_model = None,
   ) -> jnp.ndarray:
     """Sample from the probability path.
 
@@ -101,7 +102,7 @@ class BaseFlow(abc.ABC):
       at time :math:`t`.
     """
     noise = jax.random.normal(rng, shape=src.shape)
-    mu_t = self.compute_mu_t(t, src, tgt)
+    mu_t = self.compute_mu_t(t, src, tgt, correction_model)
     sigma_t = self.compute_sigma_t(t)
     return mu_t + sigma_t * noise
 
@@ -169,6 +170,12 @@ class BrownianBridge(StraightFlow):
   
 
 class LagrangianFlow(StraightFlow):
+
+  def compute_mu_t(  # noqa: D102
+      self, t: jnp.ndarray, src: jnp.ndarray, tgt: jnp.ndarray, correction_model
+  ) -> jnp.ndarray:
+    x_t = (1.0 - t) * src + t * tgt  
+    return x_t + t * (1 - t) * correction_model(t, x_t) / 10
 
   def compute_sigma_t(self, t: jnp.ndarray) -> jnp.ndarray:
     return self.sigma * jnp.sqrt(t * (1 - t))
