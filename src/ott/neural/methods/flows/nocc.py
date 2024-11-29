@@ -105,7 +105,7 @@ class NeuralOC:
         bs = source.shape[0]
         t = self.time_sampler(key_t, bs)
         x_0, x_1 = source, target
-        corr_fn = lambda t, x: corr_state.apply_fn(corr_params, t, x, x).sum()
+        corr_fn = lambda t, x, x_0_: corr_state.apply_fn(corr_params, t, x, x_0_)
         x_t = self.flow.compute_xt(key_t, t, x_0, x_1, corr_fn)
         At_T = self.flow.compute_inverse_control_matrix(t, x_t).transpose()
         U_t = self.flow.compute_potential(t, x_t)
@@ -113,9 +113,10 @@ class NeuralOC:
         dsdtdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=[1,2])
         dsdt, dsdx = dsdtdx_fn(state.params, t, x_t, x_0)
 
-        loss = -0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) - self.potential_weight * U_t.reshape(-1, 1)
+        loss = 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + self.potential_weight * U_t.reshape(-1, 1)
+        # loss = dsdt + 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + self.potential_weight * U_t.reshape(-1, 1)
 
-        return loss.mean()
+        return (loss).mean()
 
       def am_loss(state, params, key_t, corr_state, source, target):
         bs = source.shape[0]
@@ -123,7 +124,7 @@ class NeuralOC:
         # t, u0 = sample_t(u0, bs)
         x_0, x_1 = source, target
         # x_t = x_0 * (1 - t) + x_1 * t
-        corr_fn = lambda t, x: corr_state.apply_fn(corr_state.params, t, x, x).sum()
+        corr_fn = lambda t, x, x_0_: corr_state.apply_fn(corr_state.params, t, x, x_0_)
         x_t = self.flow.compute_xt(key_t, t, x_0, x_1, corr_fn)
         At_T = self.flow.compute_inverse_control_matrix(t, x_t).transpose()
         U_t = self.flow.compute_potential(t, x_t)
