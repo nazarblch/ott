@@ -113,7 +113,7 @@ class NeuralOC:
         dsdtdx_fn = jax.grad(lambda p, t, x, x0: state.apply_fn(p,t,x,x0).sum(), argnums=[1,2])
         dsdt, dsdx = dsdtdx_fn(state.params, t, x_t, x_0)
 
-        loss = 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + self.potential_weight * U_t.reshape(-1, 1)
+        loss = dsdt
         # loss = dsdt + 0.5 * ((dsdx @ At_T) * dsdx).sum(-1, keepdims=True) + self.potential_weight * U_t.reshape(-1, 1)
 
         return (loss).mean()
